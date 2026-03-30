@@ -1,0 +1,10 @@
+# Dockerfile.installer
+# ---------------------
+# Minimal image for the plugin-installer.
+# Requires only Python and uv: no application dependencies.
+
+FROM ghcr.io/matteocacciola/grinning-cat-core:latest
+
+COPY plugin_installer.py /app/plugin_installer.py
+
+CMD ["python", "/app/plugin_installer.py"]
