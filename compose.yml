@@ -1,0 +1,210 @@
+# compose.yml
+# -----------
+# Standalone stack running N replicas of grinning-cat-core behind Traefik,
+# with a single Redis and a single Qdrant.
+#
+#   traefik ──► grinning-cat-core × N ──► grinning-cat-redis
+#                                     └──► grinning-cat-vector-memory
+#
+# Works with the standard image and with the hardened one (Dockerfile:dhi, unprivileged user): the
+# image's own entrypoint is not used, bootstrap.py takes its place.
+#
+# Startup flow:
+# 1. grinning-cat-bootstrap (one-shot, same image as the replicas, run as root)
+#    seeds the shared venv from the image's one, gives the shared volumes to the
+#    image's user and applies the Redis migrations (see bootstrap.py), then exits
+#    with 0.
+# 2. The replicas start only after its exit 0. Each one activates the plugins:
+#    the core installs a plugin's dependencies (pyproject.toml + uv) in the
+#    shared venv once, serialized across the replicas by a flock on the shared
+#    plugins volume; the other replicas find them already installed.
+# 3. Traefik routes to the replicas that are healthy.
+#
+# Hot installation of a plugin: the replica receiving the upload extracts it on
+# the shared plugins volume, installs its dependencies in the shared venv and
+# publishes the event on a Redis stream; the other replicas activate it.
+# WebSocket messages reach the replica holding the connection through Redis
+# pub/sub: no sticky sessions are needed.
+#
+# The replicas share volumes and flocks, so they must run on the same Docker host.
+# Each replica holds a shared flock on the venv for its whole life: the bootstrap
+# refuses to reseed the venv while a replica is running.
+#
+# Run it from a checkout of the repository: bootstrap.py is mounted from it.
+#
+# Usage (CAT_API_KEY and CAT_JWT_SECRET in the shell or in .env):
+#   docker compose up -d
+#   CAT_REPLICAS=5 docker compose up -d        # or: docker compose up -d --scale grinning-cat-core=5
+# The API is on http://localhost:${CAT_PUBLIC_PORT:-1865}.
+
+x-core-image: &core-image ${CAT_IMAGE:-ghcr.io/grinning-cat-rag/grinning-cat-core:latest}
+
+# bootstrap.py, mounted from the checkout. If it is missing, Docker mounts an empty directory in its place (and creates
+# it on the host): the guard stops the container with an explicit message instead
+x-bootstrap-script: &bootstrap-script ./bootstrap.py:/opt/grinning-cat/bootstrap.py:ro
+x-bootstrap-entrypoint: &bootstrap-entrypoint
+  - sh
+  - -c
+  - >-
+    [ -f /opt/grinning-cat/bootstrap.py ] ||
+    { echo "bootstrap.py not found: run docker compose from a checkout of grinning-cat-swarm" >&2; exit 1; };
+    exec python /opt/grinning-cat/bootstrap.py "$$@"
+  - bootstrap.py
+
+# every other CAT_* setting (CAT_CRYPTO_KEY, CAT_CRYPTO_SALT, CAT_ADMIN_DEFAULT_PASSWORD, ...) goes in .env:
+# it must be the same for all the replicas
+x-core-env-file: &core-env-file
+  - path: .env
+    required: false
+
+x-core-environment: &core-environment
+  CAT_API_KEY: ${CAT_API_KEY:?CAT_API_KEY must be set}
+  CAT_JWT_SECRET: ${CAT_JWT_SECRET:?CAT_JWT_SECRET must be set (>= 32 random characters)}
+  CAT_REDIS_HOST: grinning-cat-redis
+  CAT_REDIS_PORT: 6379
+  CAT_QDRANT_HOST: grinning-cat-vector-memory
+  CAT_LOG_LEVEL: ${CAT_LOG_LEVEL:-INFO}
+  # the default (true) runs uvicorn with --reload
+  CAT_DEBUG: "false"
+  # behind Traefik: client IP (rate limiting) and public host come from the X-Forwarded-* headers.
+  # The replicas publish no port, so only the containers of this network can reach them
+  CAT_HTTPS_PROXY_MODE: "true"
+  CAT_CORS_FORWARDED_ALLOW_IPS: "*"
+
+services:
+
+  traefik:
+    image: ${TRAEFIK_IMAGE:-traefik:v3.7.13}
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      # only the containers of this compose project, reached on its network
+      - --providers.docker.constraints=Label(`com.docker.compose.project`,`${COMPOSE_PROJECT_NAME}`)
+      - --providers.docker.network=${COMPOSE_PROJECT_NAME}_default
+      - --entrypoints.web.address=:80
+      # no read timeout (Traefik v3 default: 60s): long uploads of documents and plugins
+      - --entrypoints.web.transport.respondingTimeouts.readTimeout=0
+      # proxies in front of Traefik whose X-Forwarded-* headers are trusted (default: none)
+      - --entrypoints.web.forwardedHeaders.trustedIPs=${CAT_TRUSTED_PROXIES:-}
+      - --ping=true
+    ports:
+      - "${CAT_PUBLIC_PORT:-1865}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: [ "CMD", "traefik", "healthcheck", "--ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # One-shot init: seeding of the shared venv + ownership of the shared volumes
+  # + migrations. It must run the same image as the replicas: the venv it seeds
+  # is the image's. Root, to give the volumes to the image's user.
+  # --------------------------------------------------------------------------
+  grinning-cat-bootstrap:
+    image: *core-image
+    user: "0"
+    # tini (docker-init) as PID 1: forwards SIGTERM to the bootstrap and reaps its zombies
+    init: true
+    entrypoint: *bootstrap-entrypoint
+    command: [ ]
+    restart: "no"
+    env_file: *core-env-file
+    environment:
+      <<: *core-environment
+      CAT_BOOTSTRAP_SOURCE_VENV: /app/.venv
+      CAT_BOOTSTRAP_SHARED_VENV: /shared/venv
+      CAT_BOOTSTRAP_PLUGINS_PATH: /app/cat/plugins
+      CAT_BOOTSTRAP_DATA_PATH: /app/data
+      CAT_BOOTSTRAP_APP_PATH: /app
+    volumes:
+      - *bootstrap-script
+      - venv_shared:/shared/venv
+      - plugins_data:/app/cat/plugins
+      - data:/app/data
+    depends_on:
+      grinning-cat-redis:
+        condition: service_healthy
+
+  grinning-cat-core:
+    image: *core-image
+    # tini (docker-init) as PID 1: forwards SIGTERM to the Cat, so the replica stops at once instead of being killed
+    # after the stop timeout, and reaps orphaned processes left as zombies (e.g. by the plugin installs)
+    init: true
+    # under tini, sh execs bootstrap.py, which holds a shared flock on the shared venv, then execs the Cat, which keeps
+    # it while it runs. Runs as the image's user; the migrations were applied by the bootstrap
+    entrypoint: *bootstrap-entrypoint
+    command: [ "exec", "--", "python", "-m", "cat.main" ]
+    deploy:
+      replicas: ${CAT_REPLICAS:-3}
+    env_file: *core-env-file
+    environment:
+      <<: *core-environment
+      CAT_BOOTSTRAP_SHARED_VENV: /app/.venv
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - *bootstrap-script
+      - plugins_data:/app/cat/plugins
+      - data:/app/data
+      - type: volume
+        source: venv_shared
+        target: /app/.venv
+        volume:
+          nocopy: true  # seeded only by grinning-cat-bootstrap
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.grinning-cat.rule=PathPrefix(`/`)
+      - traefik.http.routers.grinning-cat.entrypoints=web
+      - traefik.http.services.grinning-cat.loadbalancer.server.port=80
+    healthcheck:
+      # the image ships no curl: probe with the interpreter, like the HEALTHCHECK of Dockerfile:dhi
+      test: [ "CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health/liveness', timeout=3).status == 200 else 1)" ]
+      interval: 10s
+      timeout: 5s
+      # after a reseed of the venv, every replica waits for the plugin dependencies to be reinstalled before answering
+      start_period: 10m
+      start_interval: 5s
+      retries: 5
+    restart: always
+    depends_on:
+      grinning-cat-bootstrap:
+        condition: service_completed_successfully
+      grinning-cat-redis:
+        condition: service_healthy
+      grinning-cat-vector-memory:
+        condition: service_healthy
+
+  grinning-cat-redis:
+    image: ${REDIS_IMAGE:-redis/redis-stack-server:7.4.0-v8}
+    command: >
+      sh -c 'redis-stack-server --protected-mode no --save 60 1 --dir /data --appendonly yes --appendfsync everysec'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  grinning-cat-vector-memory:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.1}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # the image ships no curl: ask /readyz through bash's /dev/tcp
+      test: [ "CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  plugins_data:
+  data:
+  venv_shared:
+  redis_data:
+  qdrant_data:
